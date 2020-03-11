@@ -2,9 +2,11 @@ from bs4 import BeautifulSoup
 from collections import defaultdict
 import logging
 import json
+import numpy as np
 import requests
 import pickle
-from copy import deepcopy
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import linear_kernel
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +19,8 @@ class Index:
         Список описаний товаров
     downloaders: Dict[str: Downloader]
         Список скачивателей данных — по одному на категорию
+    idf: Dict[str: Dict[str: int]]
+        Веса значений параметров
     """
 
     class Downloader:
@@ -92,6 +96,7 @@ class Index:
         self.products = []
         self.descs = []
         self.downloaders = {}
+        self.idf = defaultdict(lambda: defaultdict(int))
 
     def add_downloader(self, category: str):
         downloader = Index.Downloader(self, category)
@@ -115,5 +120,85 @@ class Index:
         with open(path.replace(".json", ".pkl"), "rb") as f:
             self.descs = pickle.load(f)
 
-    def find_matches(self, query):
-        pass
+    def search_products(self,query: str, n_results: int):
+        products = self.products
+
+        def preprocess(token):
+            try:
+                return ''.join([c for c in token.lower() if (c.isalnum() or c == ' ') and c != 'â'])
+            except AttributeError:
+                return ''
+            return token
+
+        preprocessed_products = [defaultdict(str) for _ in range(len(products))]
+        for i, product in enumerate(products):
+            for feature, value in product.items():
+                preprocessed_products[i][preprocess(feature)] = preprocess(value)
+
+        # инвертировать индекс
+        inv_index = defaultdict(lambda: defaultdict(list))
+        for i, product in enumerate(products):
+            for feature, value in product.items():
+                inv_index[preprocess(feature)][preprocess(value)].append(i)
+
+        # посчитать сколько товаров с каждой фичей
+        feature_counts = defaultdict(int)
+        for feature, values in inv_index.items():
+            for value, products_with_value in values.items():
+                feature_counts[feature] += len(products_with_value)
+
+        # найти для каждого значения похожие
+        feature_values = []
+        for feature, values in inv_index.items():
+            feature_values += values.keys()
+        feature_values = list(set(feature_values))
+        similar_values = defaultdict(list)
+
+        vectorizer = TfidfVectorizer(ngram_range=(1, 4),
+                                    analyzer="char",
+                                    preprocessor=preprocess,)
+        tfidf = vectorizer.fit_transform(feature_values)
+
+        for i in range(len(feature_values) - 1):
+            cosine_similarities = linear_kernel(tfidf[i:i+1], tfidf).flatten()
+            related_docs_indices = cosine_similarities.argsort()[:-6:-1]
+            similar_values[feature_values[i]] = related_docs_indices
+
+        # дополнить индекс похожими
+        for i, product in enumerate(products):
+            for feature, value in product.items():
+                if len(value) < 100:
+                    inv_index[preprocess(feature)][preprocess(value)].append(i)
+                    for similar_value_index in similar_values[feature]:
+                        inv_index[preprocess(feature)][feature_values[similar_value_index]].append(i)
+
+        # посчитать сколько раз встречается каждое значение
+        value_counts = defaultdict(lambda: defaultdict(int))
+        for feature, values in inv_index.items():
+            for value, products_with_value in values.items():
+                value_counts[feature][value] = len(products_with_value)
+
+        # ~idf
+        idf = defaultdict(lambda: defaultdict(int))
+        for feature, counts in value_counts.items():
+            for value, count in counts.items():
+                idf[feature][value] = np.log(max([(feature_counts[feature] - count), 1e-5]) / (count + 1))
+
+        tokenized_query = [preprocess(token.strip()) for token in query.split(',')]
+        token_tfidf = vectorizer.transform(tokenized_query)
+        scores = [0] * len(products)
+        for i, token in enumerate(tokenized_query):
+            candidates = []
+            for product in products:
+                for feature, value in product.items():
+                    for product_n in inv_index[preprocess(feature)][preprocess(value)]:
+                        candidates.append(product_n)
+            for candidate in set(candidates):
+                for feature, value in preprocessed_products[candidate].items():
+                    value_i = feature_values.index(preprocessed_products[candidate][feature])
+                    cosine_similarity = linear_kernel(tfidf[value_i:value_i+1], token_tfidf[i:i+1]).flatten()[0]
+                    scores[candidate] += idf[preprocess(feature)][preprocess(value)] * np.log(1 + cosine_similarity)
+
+        ranged_indices = np.argsort(scores)[::-1]
+        return [scores[i] for i in ranged_indices[:n_results]],\
+               [products[i] for i in ranged_indices[:n_results]]
