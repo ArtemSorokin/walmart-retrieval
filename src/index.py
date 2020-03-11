@@ -108,8 +108,8 @@ class Index:
         with open(path, "w") as f:
             f.write(json.dumps(self.products))
 
-        with open(path.replace(".json", ".pkl"), "wb") as f:
-            pickle.dump(self.descs, f)
+        with open(path.replace(".json", ".txt"), "w") as f:
+            f.write('\n'.join(self.descs))
 
     def from_json(self, filename="index.json"):
         path = "data/{}".format(filename)
@@ -117,8 +117,8 @@ class Index:
         with open(path, "r") as f:
             self.products = json.load(f)
 
-        with open(path.replace(".json", ".pkl"), "rb") as f:
-            self.descs = pickle.load(f)
+        with open(path.replace(".json", ".txt"), "r") as f:
+            self.descs = [desc[:-1] for desc in f.readlines()]
 
     def search_products(self,query: str, n_results: int):
         products = self.products
